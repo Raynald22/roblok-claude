@@ -2,81 +2,80 @@ const express = require("express");
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
-// In-memory workspace store: sessionId -> { scripts, messages }
 const workspaces = new Map();
 
-const SYSTEM_PROMPT = `You are an expert Roblox Studio AI assistant, like Cursor or GitHub Copilot but for Roblox.
+const SYSTEM_PROMPT = `You are an expert Roblox Studio AI assistant, like Cursor AI but for Roblox.
 
-You have full access to the user's entire Roblox project — all scripts are provided below.
+You have full access to the user's entire project. When responding:
 
-Your behavior:
-- READ and UNDERSTAND all scripts before answering
-- When asked to add a feature, find the RIGHT file to edit (don't always create new ones)
-- When asked to fix a bug, trace it through multiple files if needed
-- When generating or editing code, always output the COMPLETE file content (not just the changed part)
-- Mention which file(s) you are editing/creating by their exact path
-- Use proper Roblox Luau: services via game:GetService(), RemoteEvents for client-server, pcall for safety
-- Add clear comments explaining what changed and why
+1. First, briefly explain what you plan to do (1-3 sentences max).
 
-Format for edits:
-1. Briefly explain what you found and what you'll do
-2. Output code block with the complete file content
-3. State the file path at the top as a comment: -- PATH: ServerScriptService.MyScript`;
+2. If you need to CREATE or EDIT files, output them using this EXACT format for each file:
 
-// ── SYNC all scripts from Roblox ──────────────────────────────
+<<<FILE>>>
+PATH: ServerScriptService.KillBrick
+ACTION: edit
+<<<CODE>>>
+-- full file content here
+<<<END>>>
+
+3. You can output multiple FILE blocks if editing multiple files.
+
+4. ACTION can be: "edit" (modify existing) or "create" (new file).
+
+5. Always output the COMPLETE file content, not just the changed lines.
+
+6. After all FILE blocks, add a short summary of what changed.
+
+Rules:
+- Use proper Roblox Luau (typed Lua)
+- Use game:GetService() for all services
+- Use RemoteEvents for client-server communication
+- Handle errors with pcall where appropriate
+- Add comments explaining non-obvious logic`;
+
+const workspaceSessions = new Map();
+
 app.post("/sync", (req, res) => {
   const { sessionId, scripts } = req.body;
   if (!sessionId || !Array.isArray(scripts)) {
     return res.status(400).json({ error: "sessionId and scripts required" });
   }
-
-  const existing = workspaces.get(sessionId) || { scripts: [], messages: [] };
+  const existing = workspaceSessions.get(sessionId) || { scripts: [], messages: [] };
   existing.scripts = scripts;
   existing.lastUpdated = Date.now();
-  workspaces.set(sessionId, existing);
-
+  workspaceSessions.set(sessionId, existing);
   console.log(`[sync] session=${sessionId} scripts=${scripts.length}`);
   res.json({ ok: true, count: scripts.length });
 });
 
-// ── Update single script (on change) ─────────────────────────
 app.post("/sync/update", (req, res) => {
   const { sessionId, script } = req.body;
-  const ws = workspaces.get(sessionId);
+  const ws = workspaceSessions.get(sessionId);
   if (!ws) return res.status(404).json({ error: "session not found, re-sync" });
-
   const idx = ws.scripts.findIndex(s => s.path === script.path);
   if (idx >= 0) ws.scripts[idx] = script;
   else ws.scripts.push(script);
   ws.lastUpdated = Date.now();
-
   res.json({ ok: true });
 });
 
-// ── Chat ──────────────────────────────────────────────────────
 app.post("/chat", async (req, res) => {
   const { sessionId, messages } = req.body;
   if (!sessionId || !Array.isArray(messages)) {
     return res.status(400).json({ error: "sessionId and messages required" });
   }
 
-  const ws = workspaces.get(sessionId) || { scripts: [], messages: [] };
+  const ws = workspaceSessions.get(sessionId) || { scripts: [], messages: [] };
 
-  // Build full project context
   let projectContext = "";
   if (ws.scripts.length > 0) {
-    const lines = ["\n\n━━━ FULL PROJECT (" + ws.scripts.length + " scripts) ━━━"];
+    const lines = [`\n\n━━━ FULL PROJECT (${ws.scripts.length} scripts) ━━━`];
     for (const s of ws.scripts) {
       lines.push(`\n[${s.kind}] ${s.path}\n\`\`\`lua\n${s.source}\n\`\`\``);
     }
     projectContext = lines.join("\n");
-  } else {
-    projectContext = "\n\n(No scripts synced yet — user hasn't opened a place or synced.)";
   }
-
-  // Save conversation
-  ws.messages = messages;
-  workspaces.set(sessionId, ws);
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -90,39 +89,55 @@ app.post("/chat", async (req, res) => {
         model: "claude-sonnet-4-20250514",
         max_tokens: 4096,
         system: SYSTEM_PROMPT + projectContext,
-        messages: messages,
+        messages,
       }),
     });
 
     const data = await response.json();
-
     if (!response.ok) {
       console.error("Anthropic error:", JSON.stringify(data));
       return res.status(500).json({ error: data });
     }
 
-    const reply = data.content[0].text;
-    res.json({ reply });
+    const rawReply = data.content[0].text;
+
+    // Parse FILE blocks from response
+    const edits = [];
+    const fileRegex = /<<<FILE>>>\s*PATH:\s*([^\n]+)\s*ACTION:\s*([^\n]+)\s*<<<CODE>>>([\s\S]*?)<<<END>>>/g;
+    let match;
+    while ((match = fileRegex.exec(rawReply)) !== null) {
+      edits.push({
+        path:    match[1].trim(),
+        action:  match[2].trim(), // "edit" or "create"
+        newCode: match[3].trim(),
+      });
+    }
+
+    // Clean reply text (remove raw FILE blocks for display)
+    const cleanReply = rawReply
+      .replace(/<<<FILE>>>[\s\S]*?<<<END>>>/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    res.json({ reply: cleanReply, edits });
   } catch (err) {
     console.error("Server error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Clear session ─────────────────────────────────────────────
 app.post("/clear", (req, res) => {
   const { sessionId } = req.body;
-  if (sessionId) workspaces.delete(sessionId);
+  if (sessionId) workspaceSessions.delete(sessionId);
   res.json({ ok: true });
 });
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Cleanup old sessions every hour
 setInterval(() => {
   const cutoff = Date.now() - 3600000;
-  for (const [id, ws] of workspaces.entries()) {
-    if (ws.lastUpdated < cutoff) workspaces.delete(id);
+  for (const [id, ws] of workspaceSessions.entries()) {
+    if (ws.lastUpdated < cutoff) workspaceSessions.delete(id);
   }
 }, 3600000);
 
