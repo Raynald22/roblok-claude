@@ -9,7 +9,7 @@ local StudioService = game:GetService("StudioService")
 -- ============================================================
 -- CONFIG — ganti URL setelah deploy proxy server kamu
 -- ============================================================
-local PROXY_URL = "https://https://roblok-claude.up.railway.app/chat"
+local PROXY_URL = "https://roblok-claude.up.railway.app/chat"
 -- ============================================================
 
 local toolbar = plugin:CreateToolbar("Claude Assistant")
