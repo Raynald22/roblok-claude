@@ -25,6 +25,10 @@ app.post("/chat", async (req, res) => {
       }),
     });
     const data = await response.json();
+    if (!response.ok) {
+      console.error("Anthropic error:", JSON.stringify(data));
+      return res.status(500).json({ error: data });
+    }
     res.json({ reply: data.content[0].text });
   } catch (err) {
     res.status(500).json({ error: err.message });
